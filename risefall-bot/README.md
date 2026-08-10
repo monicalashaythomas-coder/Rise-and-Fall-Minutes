@@ -420,6 +420,59 @@ while still leaving room to trade on stronger signals, rather than
 setting a bar these models can't currently clear at all. Tune up as
 model quality improves.
 
+## Root cause found: PSI drift detection was persistently, falsely firing
+
+Traced from a live log showing 433 consecutive `[Drift/PSI]` readings
+averaging 3.37, ranging 2.5–4.3 — for reference, PSI above ~0.25 is
+already "major shift" by standard convention, and a genuinely evolving
+market signal wouldn't sit statically in this range for an entire
+session. That flat, non-settling pattern was the signature of a
+structural scoring mismatch, not real drift, and it was the direct cause
+of the aggressive recalibration cadence (3 full lockouts in 47 minutes,
+~70% of that window spent trading-locked) reported earlier.
+
+Two real, compounding bugs, both in `DriftDetector`:
+
+1. **The PSI "reference" (expected) and "live" (actual) confidence
+   distributions were computed by two fundamentally different scoring
+   processes.** The reference came from `expanding_window_walk_forward()`'s
+   internal walk-forward backtest, which fits a *fresh* model per fold —
+   `per_layer_weights` is always `None` there, so it's scored with static
+   default fusion weights. Live confidence, by contrast, uses
+   `state.model_cache[s]`, which has its `per_layer_weights` already set
+   from the "convert OOS correlations → learned weights" step. PSI was
+   comparing a static-weight distribution against a learned-weight one —
+   not a real signal, and it never settles because the mismatch is baked
+   into how the two arrays are generated, not into anything that
+   converges over time.
+2. **`snapshot_reference()` never cleared `state.drift_confidence_history[symbol]`**
+   (the live-side comparison deque), so it kept accumulating confidence
+   values across calibration boundaries, mixing pre- and post-calibration
+   regimes into a single "live" sample compared against a reference that
+   only reflects the newest one.
+3. **`run_calibration()` — the path that actually fires often (scheduled
+   + drift-triggered) — never called `snapshot_reference()` at all.**
+   Only `deep_startup_calibration()` (meant to run once at genuine
+   process start) did. So the drift reference was effectively frozen at
+   whatever it was set to on the very first startup run and never
+   refreshed again, even as `per_layer_weights` kept adapting on every
+   subsequent cycle — compounding the mismatch further with each
+   recalibration instead of correcting it.
+
+Fixed with a new `DriftDetector.rebuild_reference_confidences()`: instead
+of reusing the walk-forward backtest's mismatched confidences, it replays
+the most recent 200 ticks through `compute_features()`/`bayesian_fusion()`
+using the model **as it will actually be scored live** (final
+`per_layer_weights` already set) — genuinely comparable to what live
+confidence will look like the moment trading resumes. Called from both
+`deep_startup_calibration()` and (newly) `run_calibration()`, and
+`snapshot_reference()` now clears the stale live-history deque every
+time it's called. Verified directly: simulated 150 live confidence
+checks against genuinely non-drifting data (same model, same
+distribution, small noise) — **zero false PSI triggers**, where the
+same non-drifting scenario would previously have shown the persistent,
+spurious pattern seen in the real logs.
+
 ## Root cause found: calibration was starving the event loop, causing repeated watchdog restarts every ~65-70 minutes
 
 Traced from a live log showing `deep_startup_calibration` (the full ~32-min,
