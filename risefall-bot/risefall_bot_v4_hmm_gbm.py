@@ -1,5 +1,5 @@
 """
-Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v11
+Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
 ==========================================================
 Single-file bot. Scans all eligible synthetic-index symbols, runs an
 18-layer intelligence pipeline per symbol using fitted statistical models,
@@ -5256,27 +5256,44 @@ async def main():
                 after) -- a lower-edge minute candidate on one symbol must
                 still be preferred over a higher-edge tick candidate on
                 another, since tick is no longer a fallback, it's simply
-                not eligible."""
-                best_sym, best_cand = None, None
+                not eligible.
+
+                BUGFIX: this path used to be exempt from passes_layer_gate()
+                entirely -- the n_agree/n_disagree numbers were computed
+                only for the printout, never checked. That let trades fire
+                with e.g. 3 agree / 11 disagree as long as the LSTM edge
+                cleared LSTM_MIN_EDGE_STANDALONE, which made AutoTune's
+                MIN_LAYER_AGREE/MAX_LAYER_DISAGREE tightening a no-op for
+                this path. Now every LSTM-standalone candidate must also
+                clear passes_layer_gate() on its minute-native feats. If
+                minute-native feats aren't available at all, we can't
+                verify the gate, so the candidate is skipped rather than
+                assumed safe."""
+                best_sym, best_cand, best_feats = None, None, None
                 for s in ready_symbols:
                     cand = lstm_evaluate(symbol_data[s])
                     if (cand is None or cand["duration_unit"] != "m"
                             or cand["edge"] < LSTM_MIN_EDGE_STANDALONE):
                         continue
+
+                    # Minute-native feats are required to verify the layer
+                    # gate -- no feats means no verification, so skip.
+                    mv_l = MinuteBarView(symbol_data[s])
+                    m_models_l = state.minute_model_cache.get(s)
+                    if not (mv_l.has_data(60) and m_models_l is not None):
+                        continue
+                    feats_s = compute_features(mv_l, m_models_l, minute_returns_window_dict)
+                    if feats_s is None:
+                        continue
+
+                    gate_ok, agree, disagree, neutral = passes_layer_gate(feats_s, cand["direction"])
+                    if not gate_ok:
+                        continue
+
                     if best_cand is None or cand["edge"] > best_cand["edge"]:
-                        best_sym, best_cand = s, cand
+                        best_sym, best_cand, best_feats = s, cand, feats_s
                 if best_cand is None:
                     return None
-                # Minute-native feats for explain_signal()'s display, when
-                # available -- falls back to tick feats only for logging
-                # purposes (Gates 1-5 never gate this trade either way).
-                mv_l = MinuteBarView(symbol_data[best_sym])
-                m_models_l = state.minute_model_cache.get(best_sym)
-                if mv_l.has_data(60) and m_models_l is not None:
-                    feats_l = compute_features(mv_l, m_models_l, minute_returns_window_dict)
-                else:
-                    feats_l = compute_features(symbol_data[best_sym], state.model_cache.get(best_sym),
-                                               returns_window_dict)
                 return {
                     "source": "lstm_standalone", "symbol": best_sym,
                     "direction": best_cand["direction"], "p_up": best_cand["p"],
@@ -5284,7 +5301,7 @@ async def main():
                     "exp_win_rate": best_cand["p"], "rating": best_cand["edge"],
                     "duration": best_cand["duration"],
                     "exec_duration": best_cand["duration"], "duration_unit": "m",
-                    "feats": feats_l, "n_agree": None,
+                    "feats": best_feats, "n_agree": None,
                 }
 
             def try_minute_gates_recovery_candidate():
@@ -5412,6 +5429,22 @@ async def main():
                         or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
                     print(f"[LSTM/Recovery/Atomic] {rec_sym} blocked at execution -- "
                           f"ensemble's read moved between scan and fire.")
+                    continue
+                # BUGFIX: re-verify the layer gate here too, same reasoning
+                # as the normal scan loop's atomic recheck -- the recovery
+                # path's LSTM-standalone candidate was gated at selection
+                # time in try_lstm_standalone_recovery() but never re-
+                # checked immediately before firing.
+                mv_atomic_l = MinuteBarView(symbol_data[rec_sym])
+                m_models_atomic_l = state.minute_model_cache.get(rec_sym)
+                feats_minute_atomic_l = (
+                    compute_features(mv_atomic_l, m_models_atomic_l, minute_returns_window_dict)
+                    if m_models_atomic_l is not None and mv_atomic_l.has_data(60) else None)
+                gate_ok_l_atomic = (passes_layer_gate(feats_minute_atomic_l, rec_dir)[0]
+                                    if feats_minute_atomic_l is not None else False)
+                if not gate_ok_l_atomic:
+                    print(f"[LSTM/Recovery/Atomic] {rec_sym} blocked at execution -- "
+                          f"layer gate no longer agrees (or feats unavailable to verify).")
                     continue
                 atomic_feats = None
             elif recovery_source == "minute_gates":
@@ -5695,19 +5728,31 @@ async def main():
                 # counts if ITS pick is also minute-duration. A tick-
                 # duration LSTM pick is not a fallback anymore -- it's
                 # simply not a qualifying candidate, full stop.
+                #
+                # BUGFIX: this path used to skip Gates 1-5 / passes_layer_gate()
+                # entirely -- n_agree/n_disagree were computed only for the
+                # log line, never enforced, so a 3-agree/11-disagree read
+                # could still open a trade purely on LSTM edge. That made
+                # AutoTune's MIN_LAYER_AGREE/MAX_LAYER_DISAGREE tightening a
+                # no-op for the trades actually firing through this path.
+                # Now the layer gate is checked here too, and if minute-
+                # native feats aren't available to verify it, the candidate
+                # is treated as not qualifying (skip, don't assume safe).
                 lstm_standalone = lstm_evaluate(sd)
+                feats_l = None
+                gate_ok_l = False
                 if (lstm_standalone is not None
                         and lstm_standalone["duration_unit"] == "m"
                         and lstm_standalone["edge"] >= LSTM_MIN_EDGE_STANDALONE):
-                    # Minute-native feats for explain_signal()'s display,
-                    # when available -- same pattern as
-                    # try_lstm_standalone_recovery() (Gates 1-5 never gate
-                    # this trade either way, this is purely for accurate
-                    # logging of what the layers actually looked like).
                     mv_l = MinuteBarView(sd)
                     m_models_l = state.minute_model_cache.get(s)
                     feats_l = (compute_features(mv_l, m_models_l, minute_returns_window_dict)
                               if mv_l.has_data(60) and m_models_l is not None else None)
+                    if feats_l is not None:
+                        gate_ok_l, n_agree_l, n_disagree_l, n_neutral_l = passes_layer_gate(
+                            feats_l, lstm_standalone["direction"])
+
+                if gate_ok_l:
                     chosen = {
                         "source": "lstm_standalone",
                         "direction": lstm_standalone["direction"],
@@ -5720,11 +5765,18 @@ async def main():
                         "duration_unit": "m",
                         "feats": feats_l,
                     }
-                    print(f"[LSTM] {s}: minute-priority pick clears the bar on its own "
+                    print(f"[LSTM] {s}: minute-priority pick clears the bar AND the layer gate "
+                          f"({n_agree_l} agree | {n_disagree_l} disagree) "
                           f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading it "
                           f"directly.")
                 else:
-                    # Nothing qualified in minutes this cycle -- wait.
+                    # Either nothing qualified in minutes this cycle, or an
+                    # LSTM candidate existed but failed the layer gate (or
+                    # couldn't be verified against it) -- wait.
+                    if lstm_standalone is not None and lstm_standalone["duration_unit"] == "m":
+                        print(f"[LSTM] {s}: edge cleared the bar but layer gate blocked it "
+                              f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree, "
+                              f"or feats unavailable to verify) -- skipping.")
                     continue
 
             direction = chosen["direction"]
@@ -5778,6 +5830,22 @@ async def main():
                         or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
                     print(f"[LSTM/Atomic] {symbol} blocked at execution -- ensemble's "
                           f"read moved between scan and fire.")
+                    continue
+                # BUGFIX: the atomic recheck used to re-verify only the LSTM
+                # edge, not the layer gate -- so even after fixing the scan
+                # side, a trade whose feats moved between scan and fire
+                # could still slip through here ungated. Re-verify the gate
+                # too, on fresh minute-native feats.
+                mv_atomic_l = MinuteBarView(sd)
+                m_models_atomic_l = state.minute_model_cache.get(symbol)
+                feats_minute_atomic_l = (
+                    compute_features(mv_atomic_l, m_models_atomic_l, minute_returns_window_dict)
+                    if m_models_atomic_l is not None and mv_atomic_l.has_data(60) else None)
+                gate_ok_l_atomic = (passes_layer_gate(feats_minute_atomic_l, direction)[0]
+                                    if feats_minute_atomic_l is not None else False)
+                if not gate_ok_l_atomic:
+                    print(f"[LSTM/Atomic] {symbol} blocked at execution -- layer gate "
+                          f"no longer agrees (or feats unavailable to verify).")
                     continue
                 atomic_feats = None
             elif source == "minute_gates":
