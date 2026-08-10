@@ -375,7 +375,14 @@ MIN_SCORE_GAP = 0.05
 # v2 autotune-settled values (e.g. min_layer_agree pushed back to 11)
 # should not carry over. Bumping forces load_gates() to detect the version
 # mismatch, discard the stale rows, and use the new code defaults (9/4).
-GATE_SCHEMA_VERSION = 5
+# v12 UPDATE: bumped again 5->6 -- MIN_LAYER_AGREE moved 10->11 and both
+# floors below were raised to match (see that section for the full
+# reasoning). A stale persisted value from before this change (e.g.
+# MIN_LAYER_AGREE=10, or anything autotune/recalibration had drifted it
+# to under the OLD floor of 4) must not silently keep being used once the
+# floor is 11 -- this forces exactly that reset, same mechanism as the
+# 4->5 bump above.
+GATE_SCHEMA_VERSION = 6
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
 # FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
@@ -403,7 +410,15 @@ GATE_SCHEMA_VERSION = 5
 # matching the original 16-9-4=3). NOT a return to the 12/16=75%
 # supermajority that caused the documented near-zero-trade-frequency
 # incident above -- 10/17=58.8% is well below that.
-MIN_LAYER_AGREE    = 10
+# v12 UPDATE: explicit instruction -- MIN_LAYER_AGREE starts at 11 (was
+# 10) and MAX_LAYER_DISAGREE stays at 4, and NEITHER may ever be adjusted
+# below these starting values by any mechanism (maybe_recalibrate_gate()'s
+# starvation/percentile paths, autotune_gates()'s relax path) -- only
+# upward (stricter agree requirement, and/or looser disagree tolerance)
+# from here. Enforced by raising GATE_ABS_FLOOR_AGREE/GATE_ABS_FLOOR_
+# DISAGREE to match below, which every adjustment path already clamps
+# through -- see maybe_recalibrate_gate()/autotune_gates() for where.
+MIN_LAYER_AGREE    = 11
 MAX_LAYER_DISAGREE = 4
 
 # ── Adaptive gate controller (v5) ───────────────────────────────────────────
@@ -425,16 +440,31 @@ MAX_LAYER_DISAGREE = 4
 # not from completed-trade win rate (autotune_gates() keeps that role as a
 # secondary quality control, not the only lever).
 GATE_SCHEMA_VERSION_BUMP_NOTE = (
-    "GATE_SCHEMA_VERSION bumped 4->5 below to force a clean reset of "
+    "GATE_SCHEMA_VERSION bumped 5->6 below to force a clean reset of "
     "whatever value is currently stuck in bot_gate_config -- MIN_LAYER_AGREE "
-    "moved 9->10 (see the v10 UPDATE comment above) when Support/Resistance "
-    "became a 17th layer, and a stale 16-layer-tuned persisted value should "
-    "not silently keep being used against the new 17-layer vote."
+    "moved 10->11 per explicit instruction, and GATE_ABS_FLOOR_AGREE/"
+    "GATE_ABS_FLOOR_DISAGREE were raised to 11/4 so no adjustment mechanism "
+    "can ever push either gate below its new starting value. A stale "
+    "persisted value from before this change should not silently keep "
+    "being used against the new floors."
 )
-GATE_ABS_FLOOR_AGREE    = 4     # never recalibrate below this (safety: some
-                                 # minimum consensus must still be required)
+# v12 UPDATE: floors raised to match the new starting values above --
+# MIN_LAYER_AGREE can only move to 11 or higher (never relaxed below the
+# 11-layer consensus bar), MAX_LAYER_DISAGREE can only move to 4 or higher
+# (never tightened below 4 layers of disagreement tolerance). Both
+# ceilings unchanged -- still real room to tighten further (agree up to
+# 14, disagree tolerance up to 8) if live performance calls for it; only
+# the downward-from-start direction is now closed off. Every adjustment
+# path (maybe_recalibrate_gate()'s starvation/percentile targets,
+# autotune_gates()'s relax branch) already clamps through these same four
+# constants, so raising the two floors alone enforces this everywhere.
+GATE_ABS_FLOOR_AGREE    = 11    # never recalibrate below this (explicit
+                                 # instruction: 11 is the floor, not just
+                                 # the starting point)
 GATE_ABS_CEIL_AGREE     = 14    # never recalibrate above this
-GATE_ABS_FLOOR_DISAGREE = 1
+GATE_ABS_FLOOR_DISAGREE = 4     # never recalibrate below this (explicit
+                                 # instruction: 4 is the floor, not just
+                                 # the starting point)
 GATE_ABS_CEIL_DISAGREE  = 8
 GATE_TARGET_PASS_RATE   = 0.12  # aim for ~12% of gate CHECKS (not trades) to
                                  # clear Gate 1 -- the knob to turn if you
@@ -3471,14 +3501,15 @@ def autotune_gates(state):
             print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades < 0.46 → TIGHTENED: "
                   f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
     elif wr > 0.54 and total_trades >= 100:
-        # FIX v3: floor lowered 10→7, disagree ceiling raised 4→6.
-        # The previous floor of 10 meant autotune could never relax below
-        # the level that was already starving the bot of trades (confirmed:
-        # it settled at 11, one step above its own floor of 10). With the
-        # new 9/4 starting point and a real floor of 7/6, autotune now has
-        # genuine room to explore toward more trade flow if win rate stays
-        # healthy, rather than oscillating against a ceiling that was set
-        # before the new downstream gates existed to share the filtering load.
+        # v12: this RELAX branch can still fire when win rate looks good,
+        # but GATE_ABS_FLOOR_AGREE/GATE_ABS_FLOOR_DISAGREE (11/4) now cap
+        # how far it can relax -- max() and min() below mean this can
+        # never push MIN_LAYER_AGREE under 11 or MAX_LAYER_DISAGREE under
+        # 4, regardless of how strong the observed win rate is. That's
+        # deliberate, explicit policy (see the MIN_LAYER_AGREE/MAX_LAYER_
+        # DISAGREE definitions above), not an oversight -- if this branch
+        # keeps firing at the floor with no further room to relax, that's
+        # expected, not a bug to fix by lowering the floor.
         new_agree = max(MIN_LAYER_AGREE - 1, GATE_ABS_FLOOR_AGREE)
         new_dis   = min(MAX_LAYER_DISAGREE + 1, GATE_ABS_CEIL_DISAGREE)
         new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)

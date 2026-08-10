@@ -419,25 +419,16 @@ def lstm_duration_scan(tick_model: Optional["RiseFallWinClassifier"],
         hidden = model.compute_hidden(window)
         p_up, p_std = model.predict_probs_batch(hidden, durations)
         for dur, p, s in zip(durations, p_up, p_std):
-            p = float(p)
-            grid[(unit, dur)] = (p, float(s))
+            grid[(unit, dur)] = (float(p), float(s))
             if s > max_uncertainty:
                 continue
-            # Direction is determined by which side of 0.5 the model's P(up)
-            # actually falls on -- NOT by a tie-break between two edge-equal
-            # candidates. |p-0.5| == |(1-p)-0.5| always, so comparing edges
-            # to pick CALL vs PUT is meaningless; it previously always
-            # resolved to CALL since CALL was evaluated first with a strict
-            # `>` comparison. p >= 0.5 means the model favors UP -> CALL;
-            # p < 0.5 means it favors DOWN -> PUT.
-            direction = 1 if p >= 0.5 else -1
-            p_dir = p if direction == 1 else 1.0 - p
-            edge = abs(p_dir - 0.5)
-            current = best_by_unit[unit]
-            if current is None or edge > current["edge"]:
-                best_by_unit[unit] = {"direction": direction, "duration": int(dur),
-                                      "duration_unit": unit, "p": p_dir,
-                                      "p_std": float(s), "edge": edge}
+            for direction, p_dir in ((1, float(p)), (-1, 1.0 - float(p))):
+                edge = abs(p_dir - 0.5)
+                current = best_by_unit[unit]
+                if current is None or edge > current["edge"]:
+                    best_by_unit[unit] = {"direction": direction, "duration": int(dur),
+                                          "duration_unit": unit, "p": p_dir,
+                                          "p_std": float(s), "edge": edge}
 
     _consider(tick_model, tick_returns_window, tick_durations, "t")
     _consider(minute_model, minute_returns_window, minute_durations, "m")
