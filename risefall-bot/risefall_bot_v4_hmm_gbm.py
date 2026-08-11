@@ -466,6 +466,29 @@ GATE_ABS_FLOOR_DISAGREE = 4     # never recalibrate below this (explicit
                                  # instruction: 4 is the floor, not just
                                  # the starting point)
 GATE_ABS_CEIL_DISAGREE  = 8
+
+# v12: the LSTM-standalone path (originating a trade purely from the
+# LSTM ensemble's own edge, independent of Gates 1-5) used to be gated
+# against the SAME MIN_LAYER_AGREE/MAX_LAYER_DISAGREE the main technical-
+# layer pipeline uses, adaptively tightened over time (see that pipeline's
+# comments for why it's designed to climb as high as 14/8 under sustained
+# weak win rate). That coupling defeats much of the point of having an
+# independent LSTM-origination path at all: once the main pipeline's bar
+# climbs toward its ceiling (confirmed live: MIN_LAYER_AGREE reached 13,
+# blocking every single LSTM-standalone candidate across all 8 symbols in
+# the same few-second window, despite each one clearing its own validated
+# LSTM_MIN_EDGE_STANDALONE), the LSTM can no longer originate ANY trade on
+# its own, no matter how confident its own edge is -- it's fully
+# subordinated to the main pipeline's independently-adapting bar instead
+# of having its own. These stay FIXED (not adaptively tuned) specifically
+# so the LSTM-standalone path keeps a stable, real quality floor
+# regardless of how tight the main pipeline's own gate has climbed --
+# still meaningful enough to block the original exploit case this gate
+# was added to prevent (3 agree / 11 disagree would still fail both
+# conditions here), just not coupled to a threshold tuned for a different
+# path's needs.
+LSTM_STANDALONE_MIN_AGREE    = 9
+LSTM_STANDALONE_MAX_DISAGREE = 6
 GATE_TARGET_PASS_RATE   = 0.12  # aim for ~12% of gate CHECKS (not trades) to
                                  # clear Gate 1 -- the knob to turn if you
                                  # want more/less trade frequency long-term
@@ -4011,6 +4034,23 @@ def passes_layer_gate(feats, direction):
     return passes, agree, disagree, neutral
 
 
+def passes_lstm_standalone_gate(feats, direction):
+    """Same structure and logic as passes_layer_gate() above, but against
+    LSTM_STANDALONE_MIN_AGREE/LSTM_STANDALONE_MAX_DISAGREE instead of
+    MIN_LAYER_AGREE/MAX_LAYER_DISAGREE -- see those constants' comment for
+    why the LSTM-standalone path needs its own, stable (non-adaptive) bar
+    rather than sharing the main pipeline's."""
+    if direction > 0:
+        agree    = feats["agree_up"]
+        disagree = feats["disagree_up"]
+    else:
+        agree    = feats["disagree_up"]
+        disagree = feats["agree_up"]
+    neutral  = feats["n_neutral"]
+    passes   = (agree >= LSTM_STANDALONE_MIN_AGREE) and (disagree <= LSTM_STANDALONE_MAX_DISAGREE)
+    return passes, agree, disagree, neutral
+
+
 # ---------------------------------------------------------------------------
 # ENSEMBLE SELECTOR
 # ---------------------------------------------------------------------------
@@ -5328,17 +5368,26 @@ async def main():
                     mv_l = MinuteBarView(symbol_data[s])
                     m_models_l = state.minute_model_cache.get(s)
                     if not (mv_l.has_data(60) and m_models_l is not None):
+                        print(f"[LSTM/Recovery] {s}: edge cleared the bar "
+                              f"(p={cand['p']:.3f} edge={cand['edge']:.3f}) but minute-native "
+                              f"feats were unavailable to verify the layer gate -- skipping.")
                         continue
                     feats_s = compute_features(mv_l, m_models_l, minute_returns_window_dict)
                     if feats_s is None:
                         continue
 
-                    gate_ok, agree, disagree, neutral = passes_layer_gate(feats_s, cand["direction"])
+                    gate_ok, agree, disagree, neutral = passes_lstm_standalone_gate(feats_s, cand["direction"])
                     if not gate_ok:
+                        print(f"[LSTM/Recovery] {s}: edge cleared the bar "
+                              f"(p={cand['p']:.3f} edge={cand['edge']:.3f}) but layer gate blocked it "
+                              f"-- {agree} agree | {disagree} disagree | {neutral} neutral "
+                              f"(need >={LSTM_STANDALONE_MIN_AGREE} agree, "
+                              f"<={LSTM_STANDALONE_MAX_DISAGREE} disagree) -- skipping.")
                         continue
 
                     if best_cand is None or cand["edge"] > best_cand["edge"]:
                         best_sym, best_cand, best_feats = s, cand, feats_s
+                        best_agree, best_disagree, best_neutral = agree, disagree, neutral
                 if best_cand is None:
                     return None
                 return {
@@ -5348,7 +5397,8 @@ async def main():
                     "exp_win_rate": best_cand["p"], "rating": best_cand["edge"],
                     "duration": best_cand["duration"],
                     "exec_duration": best_cand["duration"], "duration_unit": "m",
-                    "feats": best_feats, "n_agree": None,
+                    "feats": best_feats, "n_agree": best_agree,
+                    "n_disagree": best_disagree, "n_neutral": best_neutral,
                 }
 
             def try_minute_gates_recovery_candidate():
@@ -5420,6 +5470,7 @@ async def main():
                             "rating": rating, "duration": mc_duration_m,
                             "exec_duration": mc_duration_m, "duration_unit": "m",
                             "feats": feats_m, "n_agree": n_agree,
+                            "n_disagree": n_disagree, "n_neutral": n_neutral,
                         }
                 return best
 
@@ -5452,12 +5503,14 @@ async def main():
             rec_exec_duration, rec_exec_unit = chosen["exec_duration"], chosen["duration_unit"]
             recovery_source = chosen["source"]
             n_agree = chosen["n_agree"] if chosen["n_agree"] is not None else "n/a"
+            n_disagree = chosen.get("n_disagree", "n/a")
+            n_neutral = chosen.get("n_neutral", "n/a")
 
             n_total_layers = feats["n_layers"] if feats else 17
             print(f"[Recovery] step={state.recovery_step} stake={state.recovery_stake:.2f} "
                   f"— best signal: {rec_sym} {'CALL' if rec_dir>0 else 'PUT'} "
-                  f"({n_agree}/{n_total_layers} agree, exp_win={chosen['exp_win_rate']:.2f}, "
-                  f"source={recovery_source})")
+                  f"({n_agree} agree | {n_disagree} disagree | {n_neutral} neutral out of "
+                  f"{n_total_layers}, exp_win={chosen['exp_win_rate']:.2f}, source={recovery_source})")
 
             explain_signal(
                 symbol=rec_sym, direction=rec_dir,
@@ -5487,7 +5540,7 @@ async def main():
                 feats_minute_atomic_l = (
                     compute_features(mv_atomic_l, m_models_atomic_l, minute_returns_window_dict)
                     if m_models_atomic_l is not None and mv_atomic_l.has_data(60) else None)
-                gate_ok_l_atomic = (passes_layer_gate(feats_minute_atomic_l, rec_dir)[0]
+                gate_ok_l_atomic = (passes_lstm_standalone_gate(feats_minute_atomic_l, rec_dir)[0]
                                     if feats_minute_atomic_l is not None else False)
                 if not gate_ok_l_atomic:
                     print(f"[LSTM/Recovery/Atomic] {rec_sym} blocked at execution -- "
@@ -5796,7 +5849,7 @@ async def main():
                     feats_l = (compute_features(mv_l, m_models_l, minute_returns_window_dict)
                               if mv_l.has_data(60) and m_models_l is not None else None)
                     if feats_l is not None:
-                        gate_ok_l, n_agree_l, n_disagree_l, n_neutral_l = passes_layer_gate(
+                        gate_ok_l, n_agree_l, n_disagree_l, n_neutral_l = passes_lstm_standalone_gate(
                             feats_l, lstm_standalone["direction"])
 
                 if gate_ok_l:
@@ -5821,9 +5874,17 @@ async def main():
                     # LSTM candidate existed but failed the layer gate (or
                     # couldn't be verified against it) -- wait.
                     if lstm_standalone is not None and lstm_standalone["duration_unit"] == "m":
-                        print(f"[LSTM] {s}: edge cleared the bar but layer gate blocked it "
-                              f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree, "
-                              f"or feats unavailable to verify) -- skipping.")
+                        if feats_l is not None:
+                            print(f"[LSTM] {s}: edge cleared the bar "
+                                  f"(p={lstm_standalone['p']:.3f} edge={lstm_standalone['edge']:.3f}) "
+                                  f"but layer gate blocked it -- {n_agree_l} agree | {n_disagree_l} "
+                                  f"disagree | {n_neutral_l} neutral (need >={LSTM_STANDALONE_MIN_AGREE} "
+                                  f"agree, <={LSTM_STANDALONE_MAX_DISAGREE} disagree) -- skipping.")
+                        else:
+                            print(f"[LSTM] {s}: edge cleared the bar "
+                                  f"(p={lstm_standalone['p']:.3f} edge={lstm_standalone['edge']:.3f}) "
+                                  f"but minute-native feats were unavailable to verify the layer gate "
+                                  f"-- skipping.")
                     continue
 
             direction = chosen["direction"]
@@ -5888,7 +5949,7 @@ async def main():
                 feats_minute_atomic_l = (
                     compute_features(mv_atomic_l, m_models_atomic_l, minute_returns_window_dict)
                     if m_models_atomic_l is not None and mv_atomic_l.has_data(60) else None)
-                gate_ok_l_atomic = (passes_layer_gate(feats_minute_atomic_l, direction)[0]
+                gate_ok_l_atomic = (passes_lstm_standalone_gate(feats_minute_atomic_l, direction)[0]
                                     if feats_minute_atomic_l is not None else False)
                 if not gate_ok_l_atomic:
                     print(f"[LSTM/Atomic] {symbol} blocked at execution -- layer gate "
