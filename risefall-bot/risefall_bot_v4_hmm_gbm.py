@@ -4886,7 +4886,15 @@ async def deep_startup_calibration(state, symbol_data, symbols):
 
         # 1. Drift detector: snapshot training distribution as new reference
         train_returns = sd.returns()
-        oos_confs = reference_confs if reference_confs else report.get("all_confidences", [])
+        if reference_confs:
+            oos_confs = reference_confs
+        else:
+            oos_confs = report.get("all_confidences", [])
+            print(f"[Drift] {s}: rebuild_reference_confidences() returned empty -- "
+                  f"falling back to the walk-forward backtest's own confidences "
+                  f"(the pre-fix behavior, known to cause a persistent PSI mismatch). "
+                  f"This should be rare -- if you see this every cycle, something is "
+                  f"wrong with the replay path itself, not just a one-off data gap.")
         DriftDetector.snapshot_reference(state, s, train_returns, oos_confs)
 
         # 2. Confidence calibration: fit temperature + isotonic from OOS data
@@ -4983,8 +4991,16 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
             # DriftDetector.rebuild_reference_confidences()'s docstring
             # for the full writeup of the underlying mismatch this fixes.
             reference_confs = await asyncio.to_thread(
-            DriftDetector.rebuild_reference_confidences, sd, models, s)
-            oos_confs = reference_confs if reference_confs else confidences
+                DriftDetector.rebuild_reference_confidences, sd, models, s)
+            if reference_confs:
+                oos_confs = reference_confs
+            else:
+                oos_confs = confidences
+                print(f"[Drift] {s}: rebuild_reference_confidences() returned empty -- "
+                      f"falling back to walk_forward_validate()'s own confidences "
+                      f"(the pre-fix behavior, known to cause a persistent PSI mismatch). "
+                      f"This should be rare -- if you see this every cycle, something is "
+                      f"wrong with the replay path itself, not just a one-off data gap.")
             DriftDetector.snapshot_reference(state, s, sd.returns(), oos_confs)
 
             # v9: same parallel minute-bar model fit as deep_startup_
