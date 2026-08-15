@@ -334,9 +334,10 @@ REGIME_CFG = {
     "regime_hurst_range":  float(os.getenv("REGIME_HURST_RANGE",  "0.45")),
     "regime_vol_multiple": float(os.getenv("REGIME_VOL_MULTIPLE", "1.35")),
     # Conviction sizing. Below the floor is NO trade, not a small one.
-    "conviction_floor":    float(os.getenv("CONVICTION_FLOOR",    "0.35")),
+    "conviction_floor":    float(os.getenv("CONVICTION_FLOOR",    "0.20")),
     "conviction_min_mult": float(os.getenv("CONVICTION_MIN_MULT", "0.5")),
     "conviction_max_mult": float(os.getenv("CONVICTION_MAX_MULT", "3.0")),
+    "conviction_min_voters": int(os.getenv("CONVICTION_MIN_VOTERS", "3")),
     "conviction_max_stake": float(os.getenv("CONVICTION_MAX_STAKE", "0")),
 }
 

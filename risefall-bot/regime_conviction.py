@@ -246,14 +246,31 @@ def compute_conviction(votes: Dict[str, float],
 
     Conviction is the product of two things that must BOTH be high:
 
-      strength  = |mean(votes)|          how strongly the regime's layers lean
-      agreement = fraction agreeing      how unanimously they lean that way
+      strength  = normalised |mean(votes)|   how strongly the layers lean
+      agreement = fraction agreeing          how unanimously they lean
 
-    Multiplying rather than averaging them is deliberate. A set of layers
-    that all agree weakly (unanimous but near-zero) and a set that
-    disagrees violently (strong but split) are BOTH low-conviction, and
-    both should size small. Averaging would let one mask the other;
-    multiplying requires genuine agreement AND genuine strength.
+    STRENGTH NORMALISATION — this was a real bug, fixed after live data.
+    Originally strength was the raw |mean(votes)|, which assumed layer
+    votes span roughly [-1, 1]. They do not. Measured across 276 live
+    readings, individual votes ran ±0.06 to ±0.54 and the resulting
+    strength had a MEDIAN of 0.106 and a MAXIMUM of 0.334. Multiplying
+    that by an agreement fraction (<= 1.0) drove conviction lower still,
+    so a floor of 0.35 was mathematically unreachable — it produced
+    exactly zero trades out of 276 opportunities, not rarely but never.
+
+    The fix: divide the mean by the largest |vote| in the active set, so
+    strength measures "how aligned are these layers relative to the
+    loudest one among them" and genuinely spans [0, 1]. A single layer
+    shouting alone still scores low (the mean stays small relative to
+    that layer's own magnitude); several layers leaning together scores
+    high. That is the property we actually wanted.
+
+    Multiplying strength by agreement rather than averaging them is
+    deliberate. A set of layers that all agree weakly (unanimous but
+    near-zero) and a set that disagrees violently (strong but split) are
+    BOTH low-conviction and both should size small. Averaging would let
+    one mask the other; multiplying requires genuine agreement AND
+    genuine strength.
 
     Layers voting exactly 0.0 are treated as abstentions — excluded from
     the agreement fraction rather than counted as disagreement, since a
@@ -273,14 +290,30 @@ def compute_conviction(votes: Dict[str, float],
     non_zero = [v for v in vals if abs(v) > 1e-9]
     if not non_zero:
         return 0.0, 0, "all regime layers abstained"
+
+    # Require a minimum number of layers actually voting. Without this, a
+    # single loud layer with the rest abstaining scores respectably (1 of 1
+    # agreeing = 100% agreement, and mean/max = 1.0 when it is the only
+    # voter) — one layer is not a consensus, and sizing up on it defeats
+    # the point of routing to a layer SET.
+    min_voters = cfg.get("conviction_min_voters", 3)
+    if len(non_zero) < min_voters:
+        return 0.0, 0, (f"only {len(non_zero)} layer(s) voting, need "
+                        f">={min_voters} — not a consensus")
+
     agreeing  = sum(1 for v in non_zero if (v > 0) == (direction > 0))
     agreement = agreeing / len(non_zero)
 
-    strength   = min(1.0, abs(mean_vote))
+    # Normalise against the loudest active layer so strength spans [0,1]
+    # regardless of the absolute scale the layers happen to vote on.
+    max_mag = max(abs(v) for v in non_zero)
+    strength = min(1.0, abs(mean_vote) / max_mag) if max_mag > 0 else 0.0
+
     conviction = strength * agreement
 
     side = "CALL" if direction > 0 else "PUT"
-    reason = (f"{side} strength={strength:.3f} agreement={agreement:.2f} "
+    reason = (f"{side} strength={strength:.3f} (mean={abs(mean_vote):.3f} / "
+              f"max_layer={max_mag:.3f}) agreement={agreement:.2f} "
               f"({agreeing}/{len(non_zero)} non-abstaining) "
               f"conviction={conviction:.3f}")
     return conviction, direction, reason
@@ -304,7 +337,7 @@ def conviction_stake(conviction: float,
     not been demonstrated yet.
     """
     cfg = cfg or {}
-    floor    = cfg.get("conviction_floor",   0.35)
+    floor    = cfg.get("conviction_floor",   0.20)
     min_mult = cfg.get("conviction_min_mult", 0.5)
     max_mult = cfg.get("conviction_max_mult", 3.0)
     max_stake = cfg.get("conviction_max_stake", 0.0)  # 0 = uncapped
