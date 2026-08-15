@@ -348,6 +348,12 @@ REGIME_CFG = {
 # conviction's override at N× whatever the allocator decided.
 CONVICTION_ALLOC_CEILING = float(os.getenv("CONVICTION_ALLOC_CEILING", "2.5"))
 
+# Forced-unlock grace period. A contract that has not settled by its own
+# duration plus this many seconds is polled directly once, then abandoned
+# and the symbol released. Prevents a dropped settlement message from
+# locking a symbol for the remaining life of the process.
+CONTRACT_SETTLE_GRACE_SECS = float(os.getenv("CONTRACT_SETTLE_GRACE_SECS", "60"))
+
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
@@ -1455,15 +1461,68 @@ async def buy_contract(client, symbol, direction, duration, duration_unit, stake
     return resp["buy"]["contract_id"]
 
 
-async def wait_for_contract_result(client, contract_id):
+async def wait_for_contract_result(client, contract_id, duration_seconds=None):
+    """
+    Waits for a contract to settle, with a HARD TIMEOUT.
+
+    Previously this was an unbounded `while True` on the subscription queue.
+    If the settlement message was dropped, delayed, or the subscription
+    silently died, the coroutine waited forever and the bot froze with the
+    symbol permanently locked — no further trades on that symbol for the
+    rest of the process lifetime.
+
+    Now: wait until the contract's own duration has elapsed plus
+    CONTRACT_SETTLE_GRACE_SECS (default 60s — one minute past expiry, as
+    requested). If nothing has arrived by then, actively poll the contract
+    state once via proposal_open_contract rather than trusting the stream,
+    and if that also fails, give up and unlock so the bot keeps trading.
+
+    Returns (won: bool, profit: float). On timeout with no resolution the
+    profit is reported as 0.0 and won=False — a neutral non-result rather
+    than a fabricated win or loss, so P&L is not corrupted by a guess.
+    """
     q = client.subscribe_channel("proposal_open_contract")
-    await client.send({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1})
+    await client.send({"proposal_open_contract": 1,
+                       "contract_id": contract_id, "subscribe": 1})
+
+    if duration_seconds is None:
+        duration_seconds = 300.0
+    deadline = time.time() + float(duration_seconds) + CONTRACT_SETTLE_GRACE_SECS
+
     while True:
-        data = await q.get()
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            data = await asyncio.wait_for(q.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
         poc = data.get("proposal_open_contract", {})
         if poc.get("contract_id") == contract_id and poc.get("is_sold"):
             profit = float(poc.get("profit", 0))
             return profit > 0, profit
+
+    # Deadline hit — poll once directly instead of trusting the stream.
+    print(f"[Settle] contract {contract_id} not settled via stream after "
+          f"{duration_seconds:.0f}s + {CONTRACT_SETTLE_GRACE_SECS}s grace "
+          f"— polling directly")
+    try:
+        await client.send({"proposal_open_contract": 1,
+                           "contract_id": contract_id})
+        poll = await asyncio.wait_for(q.get(), timeout=15)
+        poc = poll.get("proposal_open_contract", {})
+        if poc.get("contract_id") == contract_id and poc.get("is_sold"):
+            profit = float(poc.get("profit", 0))
+            print(f"[Settle] direct poll resolved {contract_id}: "
+                  f"profit={profit:+.2f}")
+            return profit > 0, profit
+    except Exception as exc:
+        print(f"[Settle] direct poll failed for {contract_id}: {exc}")
+
+    print(f"[Settle] FORCED UNLOCK — {contract_id} unresolved. Reporting "
+          f"neutral (0.00) so P&L is not corrupted by a guess, and "
+          f"releasing the symbol so trading continues.")
+    return False, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -4261,7 +4320,11 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
     try:
         contract_id = await buy_contract(
             client, symbol, direction, int(duration), duration_unit, stake)
-        won, profit = await wait_for_contract_result(client, contract_id)
+        # Convert the contract's own duration to seconds so the settle
+        # timeout scales with the trade rather than using a fixed guess.
+        _dur_secs = float(duration) * (60.0 if duration_unit == "m" else 2.0)
+        won, profit = await wait_for_contract_result(
+            client, contract_id, duration_seconds=_dur_secs)
         log_trade(symbol, direction, stake, won, profit, step)
     except Exception as e:
         print(f"[Trade] Error on {symbol} step={step}: {e}")
@@ -5528,12 +5591,29 @@ async def main():
                         abs(r) for r in minute_returns[-200:]
                     ])) * 1.253 if len(minute_returns) >= 60 else 0.0
 
+                    # Base stake for conviction scaling. Deliberately uses
+                    # MIN_STAKE, not balance * STAKE_PCT.
+                    #
+                    # The earlier version used balance*STAKE_PCT, which on a
+                    # $10k balance gave a $200 base — conviction then scaled
+                    # that to $184 against an allocator value of $0.35, a
+                    # 527x disagreement that only the ceiling caught. The
+                    # allocator's number already carries drift reduction,
+                    # loss-streak reduction, correlation and exposure
+                    # penalties; sizing conviction off raw balance discards
+                    # all of it and lets the ceiling silently do the risk
+                    # management instead of the risk logic.
+                    #
+                    # Anchoring on MIN_STAKE means conviction expresses a
+                    # multiple of the smallest sane trade, and the separate
+                    # allocator ceiling still bounds it against whatever the
+                    # risk stack decided independently.
                     regime_res = regime_decision(
                         hurst=feats_m.get("hurst", 0.5),
                         sigma_now=sigma_now_m,
                         sigma_baseline=sigma_base_m,
                         layer_votes=feats_m["layer_votes"],
-                        base_stake=max(MIN_STAKE, state.balance * STAKE_PCT),
+                        base_stake=MIN_STAKE,
                         cfg=REGIME_CFG,
                     )
                     for _r in regime_res["reasons"]:
