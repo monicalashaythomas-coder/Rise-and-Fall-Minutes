@@ -3913,16 +3913,58 @@ def fuse_signal(features: dict, state: "TradeState",
 # ---------------------------------------------------------------------------
 # LAYER AGREEMENT GATE
 # ---------------------------------------------------------------------------
-def passes_layer_gate(feats, direction):
+def passes_layer_gate(feats, direction, regime=None):
     """Returns (passes: bool, agree: int, disagree: int, neutral: int).
 
-    Uses the pre-computed vote counts from compute_features. For a CALL
-    (direction=+1) the agree count is agree_up; for a PUT (direction=-1)
-    it's disagree_up (those layers voted against CALL = voted for PUT).
-
     Gate: agree >= MIN_LAYER_AGREE AND disagree <= MAX_LAYER_DISAGREE.
-    A trade with 10 agree / 4 disagree clears; one with 7 agree / 7 disagree
-    does not regardless of how high the Bayesian confidence score is."""
+
+    REGIME-AWARE COUNTING (added with regime routing):
+    When `regime` is supplied, the vote counts are computed over ONLY that
+    regime's active layer set, not all 17.
+
+    Why this matters: the regime router deliberately consults 6-7 layers
+    and ignores the other 10 precisely because their assumptions do not
+    hold in the current regime. Counting all 17 here re-admits exactly the
+    noise the routing exists to remove — mean-reversion layers voting
+    against a trend-regime signal were producing rejections like
+    "8 agree / 6 disagree" where the 6 disagreeing layers were ones the
+    router had already ruled irrelevant. Gate 1 was overruling the routing
+    with the very votes the routing excluded.
+
+    Counting only the active set preserves what this gate is FOR — needing
+    enough layers to concur, not merely a couple of loud ones — while
+    respecting which layers are currently meaningful. The thresholds are
+    scaled proportionally, since requiring 9-of-17 makes no sense when
+    only 7 layers are voting.
+
+    Passing regime=None restores the original all-17 behaviour exactly.
+    """
+    if regime is not None:
+        try:
+            from regime_conviction import REGIME_LAYERS, LAYER_NAMES
+            active = set(REGIME_LAYERS.get(regime, []))
+            votes  = feats.get("layer_votes")
+            if active and votes and len(votes) == len(LAYER_NAMES):
+                sel = [v for n, v in zip(LAYER_NAMES, votes) if n in active]
+                up   = sum(1 for v in sel if v > 0)
+                down = sum(1 for v in sel if v < 0)
+                neutral = len(sel) - up - down
+                if direction > 0:
+                    agree, disagree = up, down
+                else:
+                    agree, disagree = down, up
+                # Scale thresholds to the active subset size, with a floor
+                # of 3 agreeing so a 6-layer regime still needs real
+                # consensus rather than a bare majority of two.
+                frac = len(sel) / float(len(LAYER_NAMES))
+                min_agree = max(3, int(round(MIN_LAYER_AGREE * frac)))
+                max_dis   = max(1, int(round(MAX_LAYER_DISAGREE * frac)))
+                passes = (agree >= min_agree) and (disagree <= max_dis)
+                return passes, agree, disagree, neutral
+        except Exception as exc:
+            print(f"[Gate] regime-aware counting failed ({exc}) — "
+                  f"falling back to all-layer counting")
+
     if direction > 0:
         agree    = feats["agree_up"]
         disagree = feats["disagree_up"]
@@ -5516,8 +5558,12 @@ async def main():
                 if exp_win_rate_m < MIN_EXP_WIN_RATE:
                     return None
 
-                # Gate 1: Layer agreement
-                gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats_m, direction_m)
+                # Gate 1: Layer agreement — counted over the REGIME's active
+                # layer set when routing is on, so the layers the router
+                # deliberately ignored cannot veto through this gate.
+                _gate_regime = regime_res["regime"] if regime_res else None
+                gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(
+                    feats_m, direction_m, regime=_gate_regime)
                 # v10: this is now the ONLY signal source feeding the
                 # adaptive gate-threshold recalibration system (record_
                 # gate_vote()/maybe_recalibrate_gate()) -- the tick-gate
@@ -5528,9 +5574,14 @@ async def main():
                 record_gate_vote(state, n_agree, n_disagree, feats_m["n_layers"])
                 maybe_recalibrate_gate(state)
                 if not gate_ok:
-                    print(f"[Gate/Minute] {s} skipped — layer vote {n_agree} agree / "
-                          f"{n_disagree} disagree / {n_neutral} neutral "
-                          f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
+                    if _gate_regime:
+                        print(f"[Gate/Minute] {s} skipped — regime-scoped layer vote "
+                              f"{n_agree} agree / {n_disagree} disagree / {n_neutral} neutral "
+                              f"(counted over {_gate_regime}'s active layers only)")
+                    else:
+                        print(f"[Gate/Minute] {s} skipped — layer vote {n_agree} agree / "
+                              f"{n_disagree} disagree / {n_neutral} neutral "
+                              f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
                     return None
 
                 # Gate 2: Permutation entropy
